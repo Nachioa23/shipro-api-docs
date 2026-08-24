@@ -1,0 +1,604 @@
+openapi: 3.1.0
+
+# =============================================================================
+# CONTRATO DE API EXTERNA DE SHIPRO — v1
+# -----------------------------------------------------------------------------
+# Este es el contrato que TODO plugin de e-commerce (WooCommerce, Shopify,
+# Magento, PrestaShop, VTEX, y el propio Tiendanube) traduce. El plugin es un
+# traductor fino: toda la inteligencia (ruteo, empaquetado, seguro, pricing)
+# vive en la NPMS. El plugin nunca ve ni manda nada sobre el seguro.
+#
+# BORRADOR v1 — para revisión de producto de Nacho. Los puntos marcados con
+# `x-nucleo-dependency` describen comportamientos que el chat Núcleo debe
+# ajustar para que el código converja a este contrato ANTES de conectar el
+# primer plugin real. El contrato se puede leer y aprobar ya; conectar un
+# plugin depende de que esas dependencias estén cerradas.
+# =============================================================================
+
+info:
+  title: Shipro API Externa
+  version: "1.0.0"
+  description: >
+    API de cotización, despacho y trazabilidad de Shipro para plugins de
+    e-commerce. Shipro actúa como capa de inteligencia y control ("meta-carrier"):
+    el plugin cotiza, crea el envío y consume el tracking; el ruteo al courier,
+    el empaquetado, el seguro y el pricing los resuelve la NPMS.
+
+
+    POLÍTICA DE VENTA: la venta nunca se cae. Si un courier no responde, se
+    publica una tarifa de respaldo (`esFallback: true`). Si al crear el envío
+    faltan datos obligatorios del comprador o del paquete, el envío se crea en
+    estado `RETENIDO` con un tracking provisional de Shipro y se dispara el flujo
+    de corrección — nunca se rechaza la creación.
+
+
+    DINERO: todos los montos viajan como STRING decimal (ej. "12345.67"), no como
+    número. Es intencional: evita la pérdida de precisión de punto flotante en
+    cálculos de plata. El plugin debe parsear el string como decimal, no como
+    float.
+
+servers:
+  - url: https://api.shipro.pro/v1
+    description: Producción (servidor canónico). Destino final de la API pública.
+  - url: https://pm.shipro.pro/api/v1
+    description: >
+      Alternativa transitoria sobre el dominio actual, en uso hasta que el
+      subdominio api.shipro.pro esté enrutado. Mismo contrato, misma versión.
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Cotización
+    description: Tarifas en tiempo real para el checkout.
+  - name: Envíos
+    description: Creación de envíos y consulta de puntos de retiro.
+  - name: Trazabilidad
+    description: Seguimiento público del envío (sin datos personales).
+
+paths:
+
+  # ===========================================================================
+  # 1. COTIZAR
+  # ===========================================================================
+  /cotizar:
+    post:
+      tags: [Cotización]
+      summary: Cotizar tarifas para un carrito
+      operationId: cotizar
+      description: >
+        Devuelve las opciones de envío a domicilio y a sucursal para un destino
+        y un conjunto de paquetes. El plugin llama a este endpoint cuando el
+        comprador llega al paso de envío del checkout.
+
+
+        El plugin NO envía información de seguro ni de valor declarado: la NPMS
+        decide, según la configuración del comerciante para cada courier, si el
+        seguro va incluido y qué valor declara. El precio que devuelve este
+        endpoint ya contempla esa decisión.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CotizarRequest'
+      responses:
+        '200':
+          description: >
+            Opciones de tarifa. Si ningún courier pudo cotizar y no hay tarifa de
+            respaldo, `coberturaVacia` es true y los arrays vienen vacíos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CotizarResponse'
+        '400':
+          $ref: '#/components/responses/ErrorValidacion'
+        '401':
+          $ref: '#/components/responses/ErrorAuth'
+        '500':
+          $ref: '#/components/responses/ErrorInterno'
+
+  # ===========================================================================
+  # 2. CREAR ENVÍO
+  # ===========================================================================
+  /envios:
+    post:
+      tags: [Envíos]
+      summary: Crear un envío / generar etiqueta
+      operationId: crearEnvio
+      description: >
+        Crea un envío y dispara la generación de la etiqueta del courier elegido.
+        El plugin llama a este endpoint cuando el comprador pagó, habiendo elegido
+        una de las opciones devueltas por /cotizar (identificada por
+        `codigoServicio`).
+
+
+        POLÍTICA DE DATOS INCOMPLETOS (nunca se rechaza la venta): si faltan datos
+        obligatorios del comprador (DNI, email, teléfono) o del paquete
+        (dimensiones), el envío se crea igual en estado `RETENIDO` con un tracking
+        provisional de Shipro, y se dispara el flujo de corrección (el comprador
+        completa por un link, o el comerciante completa desde la NPMS). La etiqueta
+        real del courier se genera cuando los datos están completos.
+
+
+        IDEMPOTENCIA: enviar el header `Idempotency-Key`. Si se reintenta con la
+        misma clave, se devuelve el envío ya creado (con `replayed: true`) sin
+        recrear, recobrar ni volver a llamar al courier.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrearEnvioRequest'
+      responses:
+        '200':
+          description: >
+            Envío procesado. IMPORTANTE: el resultado se lee en el campo `status`
+            del cuerpo, NO en el código HTTP — un envío retenido o bloqueado
+            también responde 200. Valores de `status`: CREADO, RETENIDO,
+            BLOQUEADO_SALDO, BLOQUEADO_CREDENCIAL, BLOQUEADO_OPERATIVIDAD,
+            BLOQUEADO_DEPOSITO. En un reintento idempotente viene `replayed: true`.
+          headers:
+            Idempotency-Replayed:
+              schema: { type: string, enum: ["true"] }
+              description: Presente y "true" cuando la respuesta es un replay idempotente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CrearEnvioResponse'
+        '400':
+          $ref: '#/components/responses/ErrorValidacion'
+        '401':
+          $ref: '#/components/responses/ErrorAuth'
+        '422':
+          description: El courier rechazó el envío por datos inválidos del destinatario.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          $ref: '#/components/responses/ErrorInterno'
+        '503':
+          description: El courier no respondió a tiempo. Reintentar en unos segundos.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  # ===========================================================================
+  # 3. SUCURSALES / PUNTOS DE RETIRO
+  # ===========================================================================
+  /envios/sucursales:
+    get:
+      tags: [Envíos]
+      summary: Puntos de retiro cercanos a un destino
+      operationId: buscarSucursales
+      description: >
+        Devuelve los puntos de retiro (sucursales / PUDO) de un courier más
+        cercanos a un código postal, ordenados por distancia. Se usa cuando el
+        comprador elige "retiro en sucursal".
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: cp
+          in: query
+          required: true
+          schema: { type: string }
+          description: Código postal de destino.
+        - name: courier
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            Courier del cual listar sucursales. Si se omite, la NPMS usa el primer
+            courier activo del comerciante.
+          x-nucleo-dependency: >
+            Hoy el default es el literal "andreani" (sucursales/route.ts:28).
+            Debe pasar a "primer courier activo de la empresa".
+        - name: localidad
+          in: query
+          required: false
+          schema: { type: string }
+        - name: lat
+          in: query
+          required: false
+          schema: { type: number }
+          description: Latitud del comprador, para ordenar por distancia real sin geocodificar.
+        - name: lng
+          in: query
+          required: false
+          schema: { type: number }
+      responses:
+        '200':
+          description: Lista de sucursales cercanas, ordenadas por distancia.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Sucursal' }
+        '400':
+          $ref: '#/components/responses/ErrorValidacion'
+        '401':
+          $ref: '#/components/responses/ErrorAuth'
+        '500':
+          $ref: '#/components/responses/ErrorInterno'
+
+  # ===========================================================================
+  # 4. RASTREO PÚBLICO (sin PII)
+  # ===========================================================================
+  /envios/rastreo-publico:
+    get:
+      tags: [Trazabilidad]
+      summary: Seguimiento público de un envío
+      operationId: rastreoPublico
+      description: >
+        Devuelve el estado y el historial de eventos de un envío por número de
+        tracking. NO expone datos personales del comprador (ni nombre, ni
+        documento, ni dirección, ni contacto): es seguro mostrarlo en el panel del
+        comprador dentro del e-commerce.
+      security: []
+      parameters:
+        - name: tracking
+          in: query
+          required: true
+          schema: { type: string }
+          description: Número de tracking del envío.
+      responses:
+        '200':
+          description: Estado e historial del envío.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Rastreo' }
+        '400':
+          $ref: '#/components/responses/ErrorValidacion'
+        '404':
+          $ref: '#/components/responses/ErrorNoEncontrado'
+        '500':
+          $ref: '#/components/responses/ErrorInterno'
+
+# =============================================================================
+# COMPONENTES
+# =============================================================================
+components:
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: >
+        API Key del comerciante en el header Authorization: `Bearer shipro_live_...`.
+        El comerciante la obtiene y rota desde el panel de la NPMS. La key resuelve
+        la empresa; todo el tráfico queda acotado a esa empresa.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string }
+      description: >
+        Clave de idempotencia (recomendada) para reintentos seguros. Sugerido:
+        derivarla del identificador de la orden del e-commerce, así un reintento
+        del mismo pedido nunca duplica el envío.
+
+  schemas:
+
+    # ---- COTIZAR -----------------------------------------------------------
+    CotizarRequest:
+      type: object
+      required: [cpDestino, paquetes]
+      properties:
+        cpDestino:
+          type: string
+          description: Código postal de destino.
+        provinciaDestino:
+          type: string
+          description: Provincia de destino. Recomendado enviarla para ruteo correcto.
+        cpOrigen:
+          type: string
+          description: >
+            Código postal de origen. Opcional: si se omite, la NPMS usa el depósito
+            predeterminado del comerciante.
+        paquetes:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/PaqueteCotizar' }
+        valorCarrito:
+          type: number
+          description: >
+            Total de la orden. Lo usa la NPMS del lado servidor para calcular el
+            valor a asegurar cuando el comerciante tiene el seguro activado. El
+            plugin no decide nada sobre seguro; sólo informa el total.
+
+    PaqueteCotizar:
+      type: object
+      required: [pesoKg]
+      description: >
+        Un paquete a cotizar. NOTA: el plugin NO envía valor declarado ni bandera
+        de seguro. Eso lo resuelve la NPMS según la configuración del comerciante.
+      properties:
+        pesoKg:
+          type: number
+          description: Peso en kilogramos. Obligatorio.
+        largoCm: { type: number }
+        anchoCm: { type: number }
+        altoCm: { type: number }
+        contenido:
+          type: string
+          description: Descripción del contenido (opcional).
+      x-nucleo-dependency: >
+        El tipo Paquete en el código (CourierInterface.ts) hoy incluye
+        `valorDeclarado` y `requiereSeguro`. En el contrato público esos campos NO
+        existen (el seguro es 100% server-side). El path plugin-facing debe ignorar
+        cualquier valor de seguro que llegue del exterior y resolverlo internamente.
+
+    CotizarResponse:
+      type: object
+      properties:
+        domicilio:
+          type: array
+          items: { $ref: '#/components/schemas/OpcionTarifa' }
+          description: Opciones de entrega a domicilio, ordenadas según la estrategia del comerciante.
+        sucursal:
+          type: array
+          items: { $ref: '#/components/schemas/OpcionTarifa' }
+          description: Opciones de entrega a sucursal / punto de retiro.
+        coberturaVacia:
+          type: boolean
+          description: true cuando ningún courier pudo cotizar y no hubo tarifa de respaldo.
+
+    OpcionTarifa:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Identificador de la opción dentro de esta cotización.
+        codigoServicio:
+          type: string
+          description: >
+            Código de servicio ESTABLE (ej. "dom-andreani-estandar"). Es el valor
+            que el plugin guarda y reenvía en /envios para elegir esta opción. No
+            contiene datos dinámicos (ni timestamps ni IDs de sesión), así que es
+            seguro persistirlo.
+        courier:
+          type: string
+          description: Nombre visible del courier (ej. "ANDREANI").
+        modalidad:
+          type: string
+          description: Modalidad visible (ej. "Entrega a Domicilio (Estándar)").
+        precioFinal:
+          type: string
+          description: >
+            Precio final al comprador, IVA incluido, como STRING decimal (ej.
+            "12345.67"). Parsear como decimal, nunca como float.
+        slaHs:
+          type: integer
+          description: Tiempo estimado de entrega en horas.
+        fechaEstimadaString:
+          type: string
+          description: Fecha estimada legible (ej. "Llega el martes 12 de febrero").
+        etiquetaSla:
+          type: string
+          description: Origen del SLA ("Basado en datos reales" | "Tiempo estimado").
+        esFallback:
+          type: boolean
+          description: >
+            true cuando es una tarifa de RESPALDO (el courier no cotizó y se
+            publicó una tarifa de rescate para no perder la venta). El comerciante
+            puede querer tratarla distinto de una tarifa real.
+      x-nucleo-dependency: >
+        La respuesta interna de cotizar() incluye `precioProveedor` y un `desglose`
+        (cascadaNeto/smoNeto/feeNeto/netoAcumulado). Esos campos son internos de
+        Shipro y NO deben exponerse en el contrato público: el serializador
+        plugin-facing debe omitirlos.
+
+    # ---- CREAR ENVÍO -------------------------------------------------------
+    CrearEnvioRequest:
+      type: object
+      required: [destinatarioNombre, cpDestino, provinciaDestino, pesoReal, codigoServicio]
+      properties:
+        codigoServicio:
+          type: string
+          description: >
+            Código de servicio elegido, tomado de la opción de /cotizar. Identifica
+            courier + modalidad de forma estable.
+          x-nucleo-dependency: >
+            Hoy /envios recibe `nombreCourier` (string display). Debe pasar a
+            aceptar `codigoServicio` (slug estable del registry) para consistencia
+            con la cotización, siguiendo el principio de service_code estable.
+        destinatarioNombre:
+          type: string
+        cpDestino:
+          type: string
+        provinciaDestino:
+          type: string
+          description: Provincia de destino. Obligatoria.
+          x-nucleo-dependency: >
+            Hoy si falta, el adapter de Andreani rellena "Buenos Aires"
+            (AndreaniAdapter.ts:273). Debe eliminarse ese default: la provincia es
+            obligatoria en el contrato.
+        localidad: { type: string }
+        calle: { type: string }
+        altura: { type: string }
+        piso: { type: string }
+        dpto: { type: string }
+        pesoReal:
+          type: number
+          description: Peso real del envío en kg. Obligatorio.
+          x-nucleo-dependency: >
+            Hoy si falta, Mocis asume 1kg (MocisAdapter.ts:193). Debe eliminarse:
+            sin peso, el envío entra al flujo de datos incompletos (RETENIDO).
+        largoCm:
+          type: number
+          description: >
+            Dimensión en cm. Si faltan las dimensiones, el envío se crea en estado
+            RETENIDO y se pide completar (no se asume una caja por defecto).
+        anchoCm: { type: number }
+        altoCm: { type: number }
+        dni:
+          type: string
+          description: >
+            Documento del comprador. Si falta, el envío se crea RETENIDO y se pide
+            completar (no se inventa un documento).
+        email:
+          type: string
+          description: Email del comprador. Si falta, RETENIDO + corrección.
+        telefono:
+          type: string
+          description: Teléfono del comprador. Si falta, RETENIDO + corrección.
+        numeroOrden:
+          type: string
+          description: Número de orden del e-commerce (para conciliación y trazabilidad).
+        tipoOrigen:
+          type: string
+          enum: [recoleccion_courier, drop_off_cliente]
+          default: recoleccion_courier
+          description: Si el courier retira del depósito o el comerciante despacha.
+      x-nucleo-dependency: >
+        DATOS INCOMPLETOS → RETENIDO: reemplazar TODOS los fallbacks inventados de
+        los adapters (DNI "11111111", email "sin_mail@shipro.io", teléfono
+        "1100000000", dims 10x10x10, origen/remitente falsos) por: crear el envío en
+        estado RETENIDO con tracking provisional y disparar el flujo de corrección
+        existente (RETENIDO + correccionToken + /corregir). Los datos del remitente
+        (CUIT, nombre, dirección de origen) se resuelven desde Empresa/Depósito
+        (DEUDA 4 + DEUDA 29), nunca se inventan.
+      x-nucleo-dependency-seguro: >
+        El valor declarado que se envía al courier lo calcula la NPMS a partir del
+        switch de seguro por courier (quiereSeguroCourier en CredencialCourier):
+        seguro ON → valor real de la orden; seguro OFF → techo del SMO del courier.
+        El plugin no envía valorDeclarado.
+
+    CrearEnvioResponse:
+      type: object
+      properties:
+        tracking:
+          type: string
+          description: >
+            Número de tracking. En un envío CREADO es el del courier; en RETENIDO es
+            un tracking provisional de Shipro que sostiene la orden.
+        etiquetaUrl:
+          type: [string, "null"]
+          description: URL de la etiqueta (null hasta que el envío deje de estar retenido/bloqueado).
+        status:
+          type: string
+          enum:
+            - CREADO
+            - RETENIDO
+            - BLOQUEADO_SALDO
+            - BLOQUEADO_CREDENCIAL
+            - BLOQUEADO_OPERATIVIDAD
+            - BLOQUEADO_DEPOSITO
+          description: >
+            Resultado real del envío. LEER ESTE CAMPO, no sólo el HTTP 200. CREADO =
+            etiqueta lista. RETENIDO = faltan datos, envío sostenido, corrección
+            pendiente. BLOQUEADO_* = falta saldo / credencial / operatividad /
+            depósito; el envío existe pero no se despachó.
+        courier:
+          type: string
+        motivoRetencion:
+          type: string
+          description: Presente en RETENIDO/BLOQUEADO — qué falta o por qué no se despachó.
+        replayed:
+          type: boolean
+          description: true si la respuesta es un replay idempotente (no se recreó nada).
+
+    # ---- SUCURSAL ----------------------------------------------------------
+    Sucursal:
+      type: object
+      properties:
+        id: { type: string }
+        nombre: { type: string }
+        direccion: { type: string }
+        localidad: { type: string }
+        provincia: { type: string }
+        cp: { type: string }
+        latitud: { type: number }
+        longitud: { type: number }
+        distanciaKm:
+          type: number
+          description: Distancia al destino en km (aprox.).
+
+    # ---- RASTREO -----------------------------------------------------------
+    Rastreo:
+      type: object
+      properties:
+        trackingNumber: { type: string }
+        estadoActual: { type: string }
+        fechaImpresion: { type: string, format: date-time }
+        fechaColecta: { type: [string, "null"], format: date-time }
+        fechaEntrega: { type: [string, "null"], format: date-time }
+        courier:
+          type: object
+          properties:
+            nombre: { type: string }
+        empresa:
+          type: object
+          properties:
+            nombre: { type: string }
+        eventos:
+          type: array
+          items:
+            type: object
+            properties:
+              estado: { type: string }
+              observacion: { type: [string, "null"] }
+              fecha: { type: string, format: date-time }
+
+    # ---- ERROR (envelope único) -------------------------------------------
+    Error:
+      type: object
+      required: [error]
+      description: Envelope de error único de toda la API v1.
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Código estable y accionable por el plugin.
+              enum:
+                - API_KEY_REQUIRED
+                - API_KEY_INVALID
+                - VALIDATION_ERROR
+                - EMPRESA_REQUERIDA
+                - DEPOSITO_REQUERIDO
+                - COURIER_REJECTED
+                - COURIER_TIMEOUT
+                - NOT_FOUND
+                - INTERNAL_ERROR
+            message:
+              type: string
+              description: Mensaje legible (puede mostrarse en logs; no está pensado para el comprador final).
+      x-nucleo-dependency: >
+        Hoy los handlers devuelven formas dispares ({error}, {error,code},
+        {accion,...}) con casing inconsistente. Para cumplir el contrato, el path
+        plugin-facing debe envolver todas las salidas de error en este shape único
+        { error: { code, message } } con los codes del enum. El contrato manda; el
+        código converge.
+
+  responses:
+    ErrorValidacion:
+      description: Datos de entrada inválidos o incompletos.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ErrorAuth:
+      description: API Key ausente, mal formada o inválida.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ErrorNoEncontrado:
+      description: Recurso no encontrado.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ErrorInterno:
+      description: Error interno.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
