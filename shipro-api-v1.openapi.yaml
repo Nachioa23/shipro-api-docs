@@ -17,7 +17,7 @@ openapi: 3.1.0
 
 info:
   title: Shipro API Externa
-  version: "1.0.0"
+  version: "1.2.0"
   description: >
     API de cotización, despacho y trazabilidad de Shipro para plugins de
     e-commerce. Shipro actúa como capa de inteligencia y control ("meta-carrier"):
@@ -27,9 +27,11 @@ info:
 
     POLÍTICA DE VENTA: la venta nunca se cae. Si un courier no responde, se
     publica una tarifa de respaldo (`esFallback: true`). Si al crear el envío
-    faltan datos obligatorios del comprador o del paquete, el envío se crea en
-    estado `RETENIDO` con un tracking provisional de Shipro y se dispara el flujo
-    de corrección — nunca se rechaza la creación.
+    falta la DIRECCIÓN, el envío nace `RETENIDO` (lo corrige el comprador por link).
+    Si faltan PESO o DIMENSIONES del paquete, el envío nace `BLOQUEADO_DATOS_PAQUETE`,
+    se publica tarifa de rescate y los datos se completan antes de despachar. En
+    ningún caso se rechaza la creación — la venta se hace sí o sí; lo que se pausa
+    es el despacho físico hasta completar los datos.
 
 
     DINERO: todos los montos viajan como STRING decimal (ej. "12345.67"), no como
@@ -139,11 +141,13 @@ paths:
       responses:
         '200':
           description: >
-            Envío procesado. IMPORTANTE: el resultado se lee en el campo `status`
-            del cuerpo, NO en el código HTTP — un envío retenido o bloqueado
-            también responde 200. Valores de `status`: CREADO, RETENIDO,
-            BLOQUEADO_SALDO, BLOQUEADO_CREDENCIAL, BLOQUEADO_OPERATIVIDAD,
-            BLOQUEADO_DEPOSITO. En un reintento idempotente viene `replayed: true`.
+            Envío procesado. IMPORTANTE: el resultado se lee en el campo `estado`
+            del cuerpo (alias `estadoActual`), NO en el código HTTP — un envío retenido o
+            bloqueado también responde 200. El nombre `status` de versiones previas de este
+            contrato no existe en la respuesta real. Valores: Pendiente / IMPRESO (éxito, etiqueta lista), RETENIDO
+            (falta un dato, se corrige), y BLOQUEADO_* (DATOS_PAQUETE, SALDO, CREDENCIAL,
+            OPERATIVIDAD, DEPOSITO, PARCIAL). Comparar case-insensitive. En un reintento
+            idempotente viene `replayed: true`.
           headers:
             Idempotency-Replayed:
               schema: { type: string, enum: ["true"] }
@@ -435,8 +439,10 @@ components:
         largoCm:
           type: number
           description: >
-            Dimensión en cm. Si faltan las dimensiones, el envío se crea en estado
-            RETENIDO y se pide completar (no se asume una caja por defecto).
+            Dimensión en cm. Si faltan las dimensiones (o el peso), el envío nace en
+            estado BLOQUEADO_DATOS_PAQUETE y se completa antes de despachar (no se asume
+            una caja por defecto). Caso frecuente en WooCommerce: productos sin medidas
+            cargadas por el comerciante.
         anchoCm: { type: number }
         altoCm: { type: number }
         dni:
@@ -459,13 +465,15 @@ components:
           default: recoleccion_courier
           description: Si el courier retira del depósito o el comerciante despacha.
       x-nucleo-dependency: >
-        DATOS INCOMPLETOS → RETENIDO: reemplazar TODOS los fallbacks inventados de
-        los adapters (DNI "11111111", email "sin_mail@shipro.io", teléfono
-        "1100000000", dims 10x10x10, origen/remitente falsos) por: crear el envío en
-        estado RETENIDO con tracking provisional y disparar el flujo de corrección
-        existente (RETENIDO + correccionToken + /corregir). Los datos del remitente
-        (CUIT, nombre, dirección de origen) se resuelven desde Empresa/Depósito
-        (DEUDA 4 + DEUDA 29), nunca se inventan.
+        DATOS INCOMPLETOS (estado del arte al 2026-08-26, DEUDA 132 CONSTRUIDA):
+        peso/dims faltantes → el envío ya nace BLOQUEADO_DATOS_PAQUETE con tarifa de
+        rescate por courier (barrera en crear.ts, fallbacks 10x10x10 y 1kg eliminados);
+        dirección faltante/mala → RETENIDO (DEUDA 106). PENDIENTE en el núcleo: los
+        datos del COMPRADOR faltantes (DNI, email, teléfono) todavía caen a fallbacks
+        inventados en los adapters (DNI "11111111", email "sin_mail@shipro.io", teléfono
+        "1100000000") — deben enrutarse al mismo flujo de bloqueo/corrección en vez de
+        inventarse. Los datos del REMITENTE (CUIT, nombre, dirección de origen) se
+        resuelven desde Empresa/Depósito (DEUDA 4 + DEUDA 29), nunca se inventan.
       x-nucleo-dependency-seguro: >
         El valor declarado que se envía al courier lo calcula la NPMS a partir del
         switch de seguro por courier (quiereSeguroCourier en CredencialCourier):
@@ -478,25 +486,47 @@ components:
         tracking:
           type: string
           description: >
-            Número de tracking. En un envío CREADO es el del courier; en RETENIDO es
-            un tracking provisional de Shipro que sostiene la orden.
+            Número de tracking. En un envío exitoso (Pendiente/IMPRESO) es el del courier;
+            en RETENIDO es un tracking provisional de Shipro que sostiene la orden.
         etiquetaUrl:
           type: [string, "null"]
           description: URL de la etiqueta (null hasta que el envío deje de estar retenido/bloqueado).
-        status:
+        estado:
           type: string
+          description: >
+            NOMBRE DEL CAMPO: el estado viaja en `estado` (y en `estadoActual`, mismo valor).
+            Leer con prioridad estado → estadoActual. El nombre `status` que usaban versiones
+            previas de este contrato NO existe en la respuesta real — no lo busques.
           enum:
-            - CREADO
+            - Pendiente
+            - IMPRESO
             - RETENIDO
+            - BLOQUEADO_DATOS_PAQUETE
             - BLOQUEADO_SALDO
             - BLOQUEADO_CREDENCIAL
             - BLOQUEADO_OPERATIVIDAD
             - BLOQUEADO_DEPOSITO
+            - BLOQUEADO_PARCIAL
           description: >
-            Resultado real del envío. LEER ESTE CAMPO, no sólo el HTTP 200. CREADO =
-            etiqueta lista. RETENIDO = faltan datos, envío sostenido, corrección
-            pendiente. BLOQUEADO_* = falta saldo / credencial / operatividad /
+            Resultado real del envío. LEER ESTE CAMPO, no sólo el HTTP 200. IMPORTANTE:
+            los literales son strings de formato mixto (unos con mayúscula inicial como
+            "Pendiente", otros en MAYÚSCULAS como "RETENIDO"/"BLOQUEADO_*"); compará sin
+            distinguir mayúsculas/minúsculas para ser robusto (el núcleo puede normalizarlos
+            a enum más adelante). ÉXITO (etiqueta lista, mostrar tracking + link): "Pendiente"
+            (creación exitosa normal) e "IMPRESO" (etiqueta ya impresa). RETENIDO = envío
+            creado pero falta un dato para generar la etiqueta física (dirección, dimensiones,
+            provincia/CP no resuelto); se corrige y la etiqueta se genera sola — la venta no
+            se pierde. BLOQUEADO_DATOS_PAQUETE
+            = faltan PESO o DIMENSIONES del paquete (caso típico de e-commerce sin medidas
+            cargadas): el envío nace bloqueado, se publica tarifa de rescate para no frenar
+            la venta, y se completan los datos antes de despachar. BLOQUEADO_* (resto) =
+            falta saldo / credencial / operatividad /
             depósito; el envío existe pero no se despachó.
+        estadoActual:
+          type: string
+          description: >
+            Mismo valor que `estado` (campo espejo). Presente en la respuesta; podés leer
+            cualquiera de los dos.
         courier:
           type: string
         motivoRetencion:
